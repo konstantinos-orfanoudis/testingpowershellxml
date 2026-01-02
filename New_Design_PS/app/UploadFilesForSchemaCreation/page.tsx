@@ -11,7 +11,8 @@ import { openApiToConnectorSchemaFromText } from "@/lib/openapitoconnectorschema
 
 
 
-type FileRole = "auto" | "spec" | "sample" | "other";
+type FileRole = "spec" | "sample";
+
 type SpecKind = "auto" | "openapi" | "scim" | "soap";
 
 type Item = {
@@ -50,7 +51,8 @@ function isSchema(x: any): x is Schema {
 }
 
 /* ---------------- Schema model ---------------- */
-type AttrType = "String" | "Int" | "Bool" | "Datetime";
+type AttrType = "String" | "Int" | "Bool" | "Datetime" | "DateTime";
+
 type Attribute = {
   __id?: string;
   name: string;
@@ -167,18 +169,118 @@ export default function UploadPage() {
   const [parseError, setParseError] = useState<string | null>(null);
   const [selectedEntity, setSelectedEntity] = useState(0);
 
+  const [baseSchemaText, setBaseSchemaText] = useState<string | null>(null); // snapshot before AI improve
+const [aiImproving, setAiImproving] = useState(false);
+const [aiUsed, setAiUsed] = useState(false);
+
+function parseAiSchemaResult(result: unknown): any {
+  if (result && typeof result === "object") return result;
+
+  if (typeof result !== "string") {
+    throw new Error("AI returned empty/invalid result");
+  }
+
+  let s = result.trim();
+
+  // Strip ```json fences if present
+  s = s.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+
+  // If the AI included extra text, extract the first JSON object/array block
+  const block = s.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+  if (block) s = block[1];
+
+  // 1st parse
+  let v: any = JSON.parse(s);
+
+  // If it’s still a string, it’s "double encoded" -> parse again
+  if (typeof v === "string") {
+    let inner = v.trim();
+    inner = inner.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+    const innerBlock = inner.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+    if (innerBlock) inner = innerBlock[1];
+
+    try {
+      v = JSON.parse(inner);
+    } catch {
+      // Handle literal \n sequences stored as text (rare but happens)
+      v = JSON.parse(inner.replace(/\\n/g, "\n").replace(/\\"/g, '"'));
+    }
+  }
+
+  if (!v || typeof v !== "object") {
+    throw new Error("AI result parsed but is not a JSON object/array");
+  }
+
+  return v;
+}
+function normalizeConnectorSchema(v: any) {
+  // Array-of-one (n8n often returns [ {...} ])
+  if (Array.isArray(v)) {
+    if (v.length === 0) throw new Error("AI returned an empty array.");
+    return normalizeConnectorSchema(v[0]);
+  }
+
+  // Wrapped shapes
+  if (v && typeof v === "object") {
+    if (v.result != null) return normalizeConnectorSchema(v.result);
+    if (v.data != null) return normalizeConnectorSchema(v.data);
+    if (v.schema != null) return normalizeConnectorSchema(v.schema);
+
+    // ✅ If entities is a single object, wrap it into an array
+    if (v.entities && !Array.isArray(v.entities)) {
+      return { ...v, entities: [v.entities] };
+    }
+
+    return v;
+  }
+
+  // String -> parse -> normalize
+  if (typeof v === "string") {
+    let s = v.trim();
+    s = s.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+    const block = s.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+    if (block) s = block[1];
+    return normalizeConnectorSchema(JSON.parse(s));
+  }
+
+  throw new Error("AI returned an unsupported result type.");
+}
+
+
+
   // expand modal
   const [expanded, setExpanded] = useState(false);
 
   /* ---------- helper to apply schema to both states ---------- */
   function applySchema(obj: unknown) {
-    if (!obj || typeof obj !== "object") return;
-    const normalized = withStableIds(obj as Schema);
+  try {
+    // normalize common n8n/AI shapes:
+    // - [ { ... } ] (array-of-one)
+    // - { result: ... } / { data: ... }
+    // - entities: { ... } (single entity object) -> entities: [ ... ]
+    const normalizedInput = normalizeConnectorSchema(obj);
+
+    if (!normalizedInput || typeof normalizedInput !== "object") {
+      throw new Error("Schema is not an object");
+    }
+    if (!Array.isArray((normalizedInput as any).entities)) {
+      throw new Error("Schema missing entities[]");
+    }
+
+    const normalized = withStableIds(normalizedInput as Schema);
     setSchema(normalized);
+
     const replacer = (k: string, v: any) => (k.startsWith("__") ? undefined : v);
     setSchemaText(JSON.stringify(normalized, replacer, 2));
+
     if (selectedEntity >= normalized.entities.length) setSelectedEntity(0);
+    setParseError(null);
+  } catch (e: any) {
+    setParseError(e?.message ?? "Invalid schema format");
   }
+}
+
+
   function isXmlLike(file: File): boolean {
   const name = file.name.toLowerCase();
   const ext = name.split(".").pop() ?? "";
@@ -216,12 +318,12 @@ function isJsonOrYaml(file: File): boolean {
     const list = e.target.files;
     if (!list?.length) return;
     const next: Item[] = Array.from(list).map((f) => ({
-      id: `${f.name}-${f.size}-${f.lastModified}-${crypto.randomUUID()}`,
-      file: f,
-      status: "pending",
-      role: "auto",
-      specKind: "auto",
-    }));
+  id: `${f.name}-${f.size}-${f.lastModified}-${crypto.randomUUID()}`,
+  file: f,
+  status: "pending",
+  role: "sample",
+  specKind: "auto",
+}));
     setItems((prev) => {
       const map = new Map(prev.map((p) => [`${p.file.name}-${p.file.size}`, p]));
       next.forEach((n) => map.set(`${n.file.name}-${n.file.size}`, n));
@@ -239,15 +341,26 @@ function isJsonOrYaml(file: File): boolean {
   /* ---------- fixed-delay polling of result route ---------- */
   const POLL_DELAYS_MS = [30000, 15000, 15000, 10000, 15000];
   async function pollResultWithDelays(requestId: string) {
-    for (let i = 0; i < POLL_DELAYS_MS.length; i++) {
-      await new Promise((r) => setTimeout(r, POLL_DELAYS_MS[i]));
-      const res = await fetch(`/api/ai/resultFiles?id=${encodeURIComponent(requestId)}`);
-      if (!res.ok) return { ok: false, error: `${res.status} ${res.statusText}` as const };
-      const j = await res.json();
-      if (j?.ok && j.result) return { ok: true as const, result: j.result };
-    }
-    return { ok: false as const, error: "No result within polling window" };
+  const pickResult = (j: any) =>
+    j?.result ??
+    j?.data?.result ??
+    j?.item?.result ??
+    (Array.isArray(j?.items) ? j.items[0]?.result : undefined) ??
+    (Array.isArray(j) ? j[0]?.result : undefined);
+
+  for (let i = 0; i < POLL_DELAYS_MS.length; i++) {
+    await new Promise((r) => setTimeout(r, POLL_DELAYS_MS[i]));
+    const res = await fetch(`/api/ai/resultFiles?id=${encodeURIComponent(requestId)}`);
+    if (!res.ok) return { ok: false as const, error: `${res.status} ${res.statusText}` };
+
+    const j = await res.json().catch(() => null);
+    const r = pickResult(j);
+
+    // IMPORTANT: check for null/undefined, not "truthy"
+    if (j?.ok && r !== undefined && r !== null) return { ok: true as const, result: r };
   }
+  return { ok: false as const, error: "No result within polling window" };
+}
 
   async function readTextHead(f: File, max = 400_000) {
     const blob = f.size > max ? f.slice(0, max) : f;
@@ -295,22 +408,169 @@ function isJsonOrYaml(file: File): boolean {
 
     return { schemas, resourceTypes };
   }
+function revertAiSuggestion() {
+  if (!baseSchemaText) return;
+  setSchemaText(baseSchemaText);
+  setAiUsed(false);
+  try {
+    applySchema(JSON.parse(baseSchemaText));
+  } catch {
+    // leave schemaText restored even if parse fails (shouldn't)
+  }
+}
+function guessFileType(f: File) {
+  const n = f.name.toLowerCase();
+  if (n.endsWith(".json")) return "application/json";
+  if (n.endsWith(".yaml") || n.endsWith(".yml")) return "application/x-yaml";
+  if (n.endsWith(".wsdl") || n.endsWith(".xml") || n.endsWith(".xsd")) return "application/xml";
+  return f.type || "application/octet-stream";
+}
+async function improveWithAi() {
+  // We improve by sending the SPEC file to n8n, not Schema.json
+  const specItems = items.filter((i) => i.role === "spec");
+  if (!specItems.length) {
+    setParseError("Please set at least one uploaded file to File role = Spec.");
+    return;
+  }
+
+  // Prefer a file that matches the selected spec kind, otherwise first spec
+  const preferred =
+    specItems.find((x) => x.specKind === "openapi" && isJsonOrYaml(x.file)) ||
+    specItems.find((x) => x.specKind === "soap" && isXmlLike(x.file)) ||
+    specItems[0];
+
+  // Validate file vs chosen specKind (if not auto)
+  if (preferred.specKind && preferred.specKind !== "auto") {
+    const err = validateSpecFile(preferred.file, preferred.specKind);
+    if (err) {
+      setItems((prev) =>
+        prev.map((it) => (it.id === preferred.id ? { ...it, roleError: err, status: "error" } : it))
+      );
+      return;
+    }
+  }
+
+  // Snapshot current schema for Revert AI (this should be the library result)
+  setBaseSchemaText((prev) => prev ?? schemaText);
+  setAiImproving(true);
+  setParseError(null);
+
+  try {
+    const request_id = id30Base62();
+
+    // Mark the spec file as uploading (UX)
+    setItems((prev) =>
+      prev.map((it) =>
+        it.id === preferred.id ? { ...it, status: "uploading", message: "Sending spec to AI…" } : it
+      )
+    );
+
+    const form = new FormData();
+    form.append("file", preferred.file);
+    form.append("request_id", request_id);
+    form.append("fileName", preferred.file.name);
+    form.append("fileType", guessFileType(preferred.file));
+
+    // ✅ This is the key: tell n8n this is spec->schema extraction
+    form.append("intent", "extract_schema_from_spec");
+    form.append("source", "spec");
+    form.append("specKind", preferred.specKind ?? "auto"); // openapi|soap|auto
+
+    const res = await fetch("/api/ai/submitFile", { method: "POST", body: form });
+const data = await res.json().catch(() => null);
+
+if (!res.ok || !data?.ok) {
+  throw new Error(data?.error ?? `${res.status} ${res.statusText}`);
+}
+
+    setItems((prev) =>
+      prev.map((it) =>
+        it.id === preferred.id ? { ...it, status: "processing", message: "AI processing…" } : it
+      )
+    );
+
+    const out = await pollResultWithDelays(request_id);
+if (!out.ok) throw new Error(out.error);
+
+const improvedRaw = parseAiSchemaResult(out.result);
+const improved = normalizeConnectorSchema(improvedRaw);
+
+if (!Array.isArray(improved.entities)) {
+  throw new Error("AI returned JSON but not in Schema.json format (missing entities array).");
+}
+
+// Guard: prevent schema-of-schema
+if (improved.entities.some((e: any) => e?.name === "Schema")) {
+  throw new Error("AI returned schema-of-schema. Check your n8n spec branch prompt.");
+}
+console.log("AI out.result (raw):", out.result);
+console.log("AI improved (normalized):", improved);
+applySchema(improved);
+setAiUsed(true);
+
+    setItems((prev) =>
+      prev.map((it) =>
+        it.id === preferred.id ? { ...it, status: "done", message: "AI schema extracted" } : it
+      )
+    );
+  } catch (e: any) {
+    setParseError(e?.message ?? "AI extraction failed");
+    setItems((prev) =>
+      prev.map((it) =>
+        it.role === "spec" ? { ...it, status: "error", message: e?.message ?? "AI failed" } : it
+      )
+    );
+  } finally {
+    setAiImproving(false);
+  }
+}
+
 
   /* ---------- submit ---------- */
  async function submitAll() {
   if (!items.length) return;
   setSubmitting(true);
 
+  // helper: if detectUploadKind() returns unknown, sniff for OpenAPI
+  const looksLikeOpenApi = async (files: File[]) => {
+    for (const f of files) {
+      if (!isJsonOrYaml(f)) continue;
+      try {
+        const head = await readTextHead(f, 200_000);
+        // quick string sniff for JSON/YAML
+        if (head.includes('"openapi"') || head.includes("openapi:")) return true;
+        if (head.includes('"swagger"') || head.includes("swagger:")) return true;
+
+        // stronger JSON sniff (only if head is JSON)
+        try {
+          const j = JSON.parse(head);
+          if (typeof j?.openapi === "string") return true;
+          if (typeof j?.swagger === "string") return true;
+        } catch {
+          // ignore
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return false;
+  };
+
   try {
     const specItems = items.filter((i) => i.role === "spec");
     const nonSpecItems = items.filter((i) => i.role !== "spec");
 
-    // Decide what we are parsing
+    const sampleItems = items.filter((i) => i.role === "sample");
+    let parsedSpec = false;
+
     let kind: "openapi" | "scim" | "soap" | "unknown" = "unknown";
     let parseItems: Item[] = [];
 
+    // -------------------------
+    // 1) Decide what to parse
+    // -------------------------
     if (specItems.length > 0) {
-      // If user picked an explicit specKind, enforce only one
+      // If user chose explicit spec kind, enforce only one
       const explicitKinds = Array.from(
         new Set(
           specItems
@@ -333,20 +593,44 @@ function isJsonOrYaml(file: File): boolean {
       if (explicitKinds.length === 1) {
         kind = explicitKinds[0];
       } else {
-        // Auto-detect kind from spec files only
+        // Auto-detect from spec files
         const detected = await detectUploadKind(specItems.map((s) => s.file));
         kind = detected as any;
+
+        // If your detectUploadKind doesn't detect OpenAPI, sniff for it
+        if (kind === "unknown") {
+          const isOas = await looksLikeOpenApi(specItems.map((s) => s.file));
+          if (isOas) kind = "openapi";
+        }
       }
 
       parseItems = specItems;
     } else {
-      // No spec tagged -> keep your old behavior (auto-detect on everything)
+      // No spec tagged: keep legacy behavior
       const detected = await detectUploadKind(items.map((i) => i.file));
       kind = detected as any;
       parseItems = items;
     }
 
-    // Enforce: OpenAPI/SCIM specs must be JSON/YAML
+    // If spec exists but still unknown => do NOT fall back to AI (avoid confusion)
+    if (specItems.length > 0 && kind === "unknown") {
+      setItems((prev) =>
+        prev.map((i) =>
+          i.role === "spec"
+            ? {
+                ...i,
+                status: "error",
+                message: "Could not detect spec type. Please choose OpenAPI / SCIM / SOAP in the dropdown.",
+              }
+            : i
+        )
+      );
+      return;
+    }
+
+    // -------------------------
+    // 2) Enforce spec file type rules
+    // -------------------------
     if (kind === "openapi" || kind === "scim") {
       const bad = parseItems.find((it) => !isJsonOrYaml(it.file));
       if (bad) {
@@ -365,13 +649,29 @@ function isJsonOrYaml(file: File): boolean {
       }
     }
 
+    if (kind === "soap") {
+      const bad = parseItems.find((it) => !isXmlLike(it.file));
+      if (bad) {
+        setItems((prev) =>
+          prev.map((i) =>
+            i.id === bad.id
+              ? {
+                  ...i,
+                  status: "error",
+                  message: "SOAP specs must be XML/WSDL/XSD (.xml/.wsdl/.xsd).",
+                }
+              : i
+          )
+        );
+        return;
+      }
+    }
+
     // -------------------------
-    // Parse: OpenAPI
+    // 3) Parse: OpenAPI (NO AI)
     // -------------------------
     if (kind === "openapi") {
-      // Prefer the first JSON/YAML file
-      const openapiItem =
-        parseItems.find((i) => isJsonOrYaml(i.file)) ?? parseItems[0];
+      const openapiItem = parseItems.find((i) => isJsonOrYaml(i.file)) ?? parseItems[0];
 
       if (!openapiItem) {
         setItems((prev) => prev.map((i) => ({ ...i, status: "error", message: "No OpenAPI spec file found." })));
@@ -380,39 +680,53 @@ function isJsonOrYaml(file: File): boolean {
 
       setStatus(openapiItem.id, "processing", "Parsing OpenAPI…");
 
-      const specText = await openapiItem.file.text();
+      try {
+        const specText = await openapiItem.file.text();
 
-      // >>> Your converter call (adjust name/options if needed)
-      const schemaObj = await openApiToConnectorSchemaFromText(specText, {
-        schemaName: "Connector",
-        version: "1.0.0",
-        keyCandidates: ["id"],
-        flatten: true,
-      });
+        const schemaObj = await openApiToConnectorSchemaFromText(specText, {
+          schemaName: "Connector",
+          version: "1.0.0",
+          keyCandidates: ["id"],
+          flatten: true,
+        });
 
-      applySchema(schemaObj);
+        applySchema(schemaObj);
 
-      setItems((prev) =>
-        prev.map((i) => {
-          if (i.id === openapiItem.id) return { ...i, status: "done", message: "OpenAPI parsed" };
-          // mark other spec files as done/not used
-          if (specItems.length > 0 && i.role === "spec") return { ...i, status: "done", message: i.message ?? "Not used for parsing" };
-          return i;
-        })
-      );
+        // Mark spec files done; DO NOT send spec to AI
+        setItems((prev) =>
+          prev.map((i) => {
+            if (i.role !== "spec") return i;
 
-      return;
-    }
+            if (i.id === openapiItem.id) {
+              return { ...i, status: "done", message: "OpenAPI parsed", roleError: undefined, roleHint: undefined };
+            }
+            return { ...i, status: "done", message: i.message ?? "Not used for parsing", roleError: undefined, roleHint: undefined };
+          })
+        );
+        parsedSpec = true;
+
+      // OPTIONAL: baseline snapshot after library extraction
+      // (so Improve-with-AI can revert to “pure library result” even if user never edits)
+      setBaseSchemaText(JSON.stringify(schemaObj, null, 2));
+      setAiUsed(false);
+      } catch (e: any) {
+        setStatus(openapiItem.id, "error", e?.message ?? "OpenAPI parse failed");
+      }
+
+      
+          }
 
     // -------------------------
-    // Parse: SCIM
+    // 4) Parse: SCIM (NO AI)
     // -------------------------
     if (kind === "scim") {
       const files = parseItems.map((i) => i.file);
       const { schemas, resourceTypes } = await readScimDocs(files);
 
       if (!schemas.length && !resourceTypes.length) {
-        setItems((prev) => prev.map((i) => ({ ...i, status: "error", message: "No SCIM schemas/resourceTypes found." })));
+        setItems((prev) =>
+          prev.map((i) => ({ ...i, status: "error", message: "No SCIM schemas/resourceTypes found in uploaded files." }))
+        );
         return;
       }
 
@@ -426,16 +740,21 @@ function isJsonOrYaml(file: File): boolean {
 
       setItems((prev) =>
         prev.map((i) => {
-          if (specItems.length > 0 && i.role !== "spec") return i; // don't touch non-spec items
-          return { ...i, status: "done", message: "SCIM parsed" };
+          if (specItems.length > 0 && i.role !== "spec") return i;
+          return { ...i, status: "done", message: "SCIM parsed", roleError: undefined, roleHint: undefined };
         })
       );
 
-      return;
+      parsedSpec = true;
+
+      // OPTIONAL: baseline snapshot after library extraction
+      // (so Improve-with-AI can revert to “pure library result” even if user never edits)
+      setBaseSchemaText(JSON.stringify(schemaObj, null, 2));
+      setAiUsed(false);
     }
 
     // -------------------------
-    // Parse: SOAP
+    // 5) Parse: SOAP (NO AI)
     // -------------------------
     if (kind === "soap") {
       const texts = await Promise.all(parseItems.map((i) => i.file.text()));
@@ -445,23 +764,36 @@ function isJsonOrYaml(file: File): boolean {
       setItems((prev) =>
         prev.map((i) => {
           if (specItems.length > 0 && i.role !== "spec") return i;
-          return { ...i, status: "done", message: "SOAP parsed" };
+          return { ...i, status: "done", message: "SOAP parsed", roleError: undefined, roleHint: undefined };
         })
       );
 
-      return;
+      parsedSpec = true;
+
+      // OPTIONAL: baseline snapshot after library extraction
+      // (so Improve-with-AI can revert to “pure library result” even if user never edits)
+      setBaseSchemaText(JSON.stringify(schemaObj, null, 2));
+      setAiUsed(false);
     }
 
     // -------------------------
-    // Fallback: AI pipeline
-    // If spec items exist, don't send them to AI—only send non-spec.
+    // 6) Fallback: AI pipeline (ONLY non-spec)
     // -------------------------
-    const aiItems = specItems.length > 0 ? nonSpecItems : items;
+    const aiItems = sampleItems;
 
-    if (!aiItems.length) {
-      setItems((prev) => prev.map((i) => ({ ...i, status: "error", message: "No files available for AI (only spec files uploaded)." })));
-      return;
-    }
+if (!aiItems.length) {
+  // If we successfully parsed a spec, that's ok — no need to error.
+  if (parsedSpec) return;
+
+  setItems((prev) =>
+    prev.map((i) => ({
+      ...i,
+      status: "error",
+      message: "No sample files to send to AI.",
+    }))
+  );
+  return;
+}
 
     const request_id = id30Base62();
 
@@ -473,16 +805,17 @@ function isJsonOrYaml(file: File): boolean {
         form.append("file", it.file);
         form.append("request_id", request_id);
         form.append("filename", it.file.name);
-        form.append("fileType", it.file.type || "application/octet-stream");
+        form.append("fileType", guessFileType(it.file));
         form.append("size", String(it.file.size));
-
+        form.append("intent", "infer_from_samples");
+        form.append("source", "samples");
         try {
           const res = await fetch("/api/ai/submitFile", { method: "POST", body: form });
-          if (!res.ok) {
-            setStatus(it.id, "error", `${res.status} ${res.statusText}`);
-            return;
-          }
-          await res.json().catch(() => ({} as any));
+const data = await res.json().catch(() => null);
+
+if (!res.ok || !data?.ok) {
+  throw new Error(data?.error ?? `${res.status} ${res.statusText}`);
+}
           setStatus(it.id, "processing", "Queued");
         } catch {
           setStatus(it.id, "error", "Network error");
@@ -500,8 +833,11 @@ function isJsonOrYaml(file: File): boolean {
 
       setItems((prev) =>
         prev.map((i) => {
-          // spec files remain untouched if present
-          if (specItems.length > 0 && i.role === "spec") return { ...i, status: "done", message: i.message ?? "Spec not sent to AI" };
+          if (specItems.length > 0 && i.role === "spec") {
+            // spec was intentionally not sent
+            return { ...i, status: "done", message: i.message ?? "Spec not sent to AI" };
+          }
+          // AI items
           return { ...i, status: "done", message: "Completed" };
         })
       );
@@ -705,7 +1041,6 @@ function isJsonOrYaml(file: File): boolean {
         <h1 className="text-lg font-semibold text-slate-900">Upload &amp; Submit</h1>
         <p className="mt-1 text-sm text-slate-600">
           You can <b>build a schema from scratch</b> below or upload files and let us parse them.
-          Supported files: <b>JSON, XML</b>.
         </p>
 
         <div className="mt-4 flex flex-wrap items-center gap-3">
@@ -768,101 +1103,122 @@ function isJsonOrYaml(file: File): boolean {
                     {it.roleError && <div className="mt-1 text-[11px] text-rose-700">{it.roleError}</div>}
 
                   </div>
-                  <div className="flex items-center gap-3">
-                    <span
-                      className={
-                        "rounded-full px-2 py-0.5 text-xs " +
-                        (it.status === "pending"
-                          ? "bg-slate-100 text-slate-800"
-                          : it.status === "uploading"
-                          ? "bg-amber-100 text-amber-900"
-                          : it.status === "processing"
-                          ? "bg-blue-100 text-blue-900"
-                          : it.status === "done"
-                          ? "bg-emerald-100 text-emerald-900"
-                          : "bg-rose-100 text-rose-900")
-                      }
-                    >
-                      {it.status}
-                    </span>
-                    {/* Role selector */}
-<select
-  className="rounded-md border border-slate-300 px-2 py-1 text-xs"
-  value={it.role}
-  disabled={submitting}
-  onChange={(e) => {
-    const role = e.target.value as FileRole;
-
-    setItems((prev) =>
-      prev.map((x) => {
-        if (x.id !== it.id) return x;
-
-        // If switching to spec, keep/specify specKind
-        if (role === "spec") {
-          const specKind = x.specKind ?? "auto";
-          // If specKind already known and invalid, block the switch
-          const err = specKind !== "auto" ? validateSpecFile(x.file, specKind) : null;
-          if (err) {
-            return { ...x, roleError: err, roleHint: "Change spec type or upload JSON/YAML." };
-          }
-          return { ...x, role, specKind, roleError: undefined };
-        }
-
-        // Leaving spec clears specKind + errors
-        return { ...x, role, specKind: undefined, roleError: undefined };
-      })
-    );
-  }}
->
-  <option value="auto">Auto</option>
-  <option value="spec">Spec</option>
-  <option value="sample">Sample</option>
-  <option value="other">Other</option>
-</select>
-
-{/* Spec kind selector (only when role=spec) */}
-{it.role === "spec" && (
-  <select
-    className="rounded-md border border-slate-300 px-2 py-1 text-xs"
-    value={it.specKind ?? "auto"}
-    disabled={submitting}
-    onChange={(e) => {
-      const specKind = e.target.value as SpecKind;
-
-      setItems((prev) =>
-        prev.map((x) => {
-          if (x.id !== it.id) return x;
-          const err = specKind !== "auto" ? validateSpecFile(x.file, specKind) : null;
-          return {
-            ...x,
-            specKind,
-            roleError: err ?? undefined,
-            roleHint:
-              specKind === "openapi" || specKind === "scim"
-                ? "Spec must be JSON/YAML."
-                : specKind === "soap"
-                ? "Spec must be XML/WSDL/XSD."
-                : undefined,
-          };
-        })
-      );
-    }}
+                  <div className="flex items-end gap-3">
+  {/* Status pill aligned to bottom */}
+  <span
+    className={
+      "mb-1 rounded-full px-2 py-0.5 text-xs " +
+      (it.status === "pending"
+        ? "bg-slate-100 text-slate-800"
+        : it.status === "uploading"
+        ? "bg-amber-100 text-amber-900"
+        : it.status === "processing"
+        ? "bg-blue-100 text-blue-900"
+        : it.status === "done"
+        ? "bg-emerald-100 text-emerald-900"
+        : "bg-rose-100 text-rose-900")
+    }
   >
-    <option value="auto">Auto-detect</option>
-    <option value="openapi">OpenAPI / Swagger</option>
-    <option value="scim">SCIM</option>
-    <option value="soap">SOAP</option>
-  </select>
-)}
+    {it.status}
+  </span>
 
-                    <button
-                      disabled={submitting || it.status === "uploading"}
-                      onClick={() => removeOne(it.id)}
-                      className="text-xs text-rose-700 hover:text-rose-900 disabled:opacity-50"
-                    >
-                      Remove
-                    </button>
-                  </div>
+  {/* Role dropdown (Spec / Samples only) */}
+  <div className="flex flex-col gap-1">
+    <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide text-left pr-20">
+            File role
+</div>
+
+
+    <select
+      className="h-8 w-[120px] rounded-md border border-slate-300 bg-white px-2 text-xs"
+      value={it.role}
+      disabled={submitting}
+      onChange={(e) => {
+        const role = e.target.value as FileRole;
+
+        setItems((prev) =>
+          prev.map((x) => {
+            if (x.id !== it.id) return x;
+
+            if (role === "spec") {
+              // keep specKind; default to auto if missing
+              return {
+                ...x,
+                role,
+                specKind: x.specKind ?? "auto",
+                roleError: undefined,
+                roleHint: undefined,
+              };
+            }
+
+            // role === "sample"
+            return {
+              ...x,
+              role,
+              specKind: "auto",
+              roleError: undefined,
+              roleHint: undefined,
+            };
+          })
+        );
+      }}
+    >
+      <option value="sample">Samples</option>
+      <option value="spec">Spec</option>
+    </select>
+  </div>
+
+  {/* Spec type dropdown (only when Spec selected) */}
+  {it.role === "spec" && (
+    <div className="flex flex-col gap-1">
+      <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">
+        Spec type
+      </div>
+
+      <select
+        className="h-8 w-[160px] rounded-md border border-slate-300 bg-white px-2 text-xs"
+        value={it.specKind ?? "auto"}
+        disabled={submitting}
+        onChange={(e) => {
+          const specKind = e.target.value as SpecKind;
+
+          setItems((prev) =>
+            prev.map((x) => {
+              if (x.id !== it.id) return x;
+              const err = specKind !== "auto" ? validateSpecFile(x.file, specKind) : null;
+              return {
+                ...x,
+                specKind,
+                roleError: err ?? undefined,
+                roleHint:
+                  specKind === "openapi" || specKind === "scim"
+                    ? "Spec must be JSON/YAML."
+                    : specKind === "soap"
+                    ? "Spec must be XML/WSDL/XSD."
+                    : undefined,
+              };
+            })
+          );
+        }}
+      >
+        <option value="auto">Auto-detect</option>
+        <option value="openapi">OpenAPI / Swagger</option>
+        <option value="scim">SCIM</option>
+        <option value="soap">SOAP</option>
+      </select>
+    </div>
+  )}
+
+  {/* Remove aligned to bottom */}
+  <button
+    disabled={submitting || it.status === "uploading"}
+    onClick={() => removeOne(it.id)}
+    className="mb-1 text-xs text-rose-700 hover:text-rose-900 disabled:opacity-50"
+  >
+    Remove
+  </button>
+</div>
+
                 </li>
               ))}
             </ul>
@@ -1035,13 +1391,37 @@ function isJsonOrYaml(file: File): boolean {
         <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
           <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
             <div className="text-sm font-semibold text-slate-900">Schema.json</div>
-            <button
-              onClick={() => setExpanded(true)}
-              className="rounded-md border border-slate-300 px-3 py-1.5 text-xs hover:bg-slate-50"
-              title="Expand"
-            >
-              Expand
-            </button>
+            <div className="flex items-center gap-2">
+  <button
+    type="button"
+    onClick={improveWithAi}
+    disabled={aiImproving || !items.some((i) => i.role === "spec")}
+    className="rounded-md border border-slate-300 px-3 py-1.5 text-xs hover:bg-slate-50 disabled:opacity-50"
+    title="Send the extracted schema to n8n to edit it"
+  >
+    {aiImproving ? "Editing…" : "Edit with AI"}
+  </button>
+
+  <button
+    type="button"
+    onClick={revertAiSuggestion}
+    disabled={!aiUsed || !baseSchemaText || aiImproving}
+    className="rounded-md border border-slate-300 px-3 py-1.5 text-xs hover:bg-slate-50 disabled:opacity-50"
+    title="Revert back to the schema before AI changes"
+  >
+    Revert AI
+  </button>
+
+  <button
+    type="button"
+    onClick={() => setExpanded(true)}
+    className="rounded-md border border-slate-300 px-3 py-1.5 text-xs hover:bg-slate-50"
+    title="Expand"
+  >
+    Expand
+  </button>
+</div>
+
           </div>
           <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2">
             <button
@@ -1075,6 +1455,25 @@ function isJsonOrYaml(file: File): boolean {
             <div className="px-4 py-3 border-b flex items-center justify-between">
               <div className="text-sm font-semibold text-slate-900">Schema.json (Expanded)</div>
               <div className="flex items-center gap-2">
+                 <button
+    type="button"
+    onClick={improveWithAi}
+    disabled={aiImproving || !items.some((i) => i.role === "spec")}
+    className="rounded-md border border-slate-300 px-3 py-1.5 text-xs hover:bg-slate-50 disabled:opacity-50"
+    title="Send the extracted schema to n8n to improve it"
+  >
+    {aiImproving ? "Editing…" : "Edit with AI"}
+  </button>
+
+  <button
+    type="button"
+    onClick={revertAiSuggestion}
+    disabled={!aiUsed || !baseSchemaText || aiImproving}
+    className="rounded-md border border-slate-300 px-3 py-1.5 text-xs hover:bg-slate-50 disabled:opacity-50"
+    title="Revert back to the schema before AI changes"
+  >
+    Revert AI
+  </button>
                 <button
                   onClick={() => {
                     try {
